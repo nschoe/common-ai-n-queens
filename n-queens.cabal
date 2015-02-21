@@ -2,7 +2,7 @@
 -- documentation, see http://haskell.org/cabal/users-guide/
 
 name:                n-queens
-version:             0.0.1
+version:             0.2
 synopsis:            Overview of several algorithms to solve the N-Queens problem.
 -- description:         
 license:             BSD3
