@@ -5,8 +5,8 @@ import System.IO (hFlush, stdout)
 import System.Exit (exitSuccess)
 import Data.List (sort, intersperse, (\\), sortBy)
 import Data.IORef (newIORef, writeIORef, readIORef, IORef)
-import System.Random (randomRs, newStdGen)
-
+import System.Random (randomRs, newStdGen, randomR)
+import Control.Concurrent (forkIO, killThread)
 ------------------------------------------------------------------------------------------------------------------------
 
 -- Current version
@@ -65,29 +65,6 @@ displayBoard (Board n xs) = do
           breakEveryN [] = []
           breakEveryN xs = intersperse ' ' (take n xs) ++ '\n' : breakEveryN (drop n xs)
 
-{-
-To check if a board if valid,
-    1. check if two queens have same column OR same line
-    2. compute the absolute difference between coordinates of each queens and check if there are some doublons
--}
--- isBoardValid :: Board -> Bool
--- isBoardValid (Board n xs) =
---     let orthogonalCheck  = checkRowAndCols xs
---         newCoordinates   = map rotate45 xs
---         diagonalCheck    = checkRowAndCols newCoordinates
---     in orthogonalCheck && diagonalCheck
-
---     where checkRowAndCols = checkRowAndCols' [] []
-
---           checkRowAndCols' _ _ []           = True
---           checkRowAndCols' xs ys ((x,y):cs) | x `elem` xs || y `elem` ys = False
---                                             | otherwise                  = checkRowAndCols' (x:xs) (y:ys) cs
-          
---           rotate45 (x, y) =
---             let x' = x - y
---                 y' = x + y
---             in (x', y')
-
 countAttackingPairs :: Board -> Int
 countAttackingPairs (Board n xs) =
     let orthogonalAttacks  = checkRowsAndCols xs
@@ -121,11 +98,14 @@ greetings = do
 -- Present the user with the list of possible actions
 displayMenu :: IO ()
 displayMenu = do
-    let str = "Here are the current supported actions:"
-        menu = ["r8:\tGenerate random 8x8 board."
-              , "hill\tSolve board with hill climbing algorithm"
-              , "q:\tExit Program."
-              , "d:\tDebug"
+    let str = "\nHere are the current supported actions (\"_s\" means non-verbose (silent) version):"
+        menu = ["r8:\t\tGenerate random 8x8 board."
+              , "r:\t\tGenerate random NxN board (N is asked)"
+              , "hill(_s):\tSolve board with hill-climbing algorithm"
+              , "hill_rr(_s):\tSolve board with hill-climbing algorithm with random restart"
+              , "stats_hill:\tRun stats on the hill-climbing algorithm"
+              , "stats_hill_rr:\tRun stats on the hill-climbing algorithm with random restart"
+              , "q:\t\tExit Program."
                ]
     putStrLn str
     forM_ menu (putStrLn . (:) '\t')
@@ -137,11 +117,16 @@ handleInput board = do
     hFlush stdout
     input <- getLine
     case input of
-        "r8"      -> generateRandomN board 8
-        "hill"    -> hillClimbing board
-        "q"       -> exitProgram
-        "d"       -> debug board
-        otherwise -> wrongInput board
+        "r8"            -> generateRandomN True board 8
+        "r"             -> askDim >>= generateRandomN True board
+        "hill"          -> hillClimbing True board >> return ()
+        "hill_s"        -> hillClimbing False board >> return ()
+        "hill_rr"       -> hillClimbingRandomRestart True board >> return ()
+        "hill_rr_s"     -> hillClimbingRandomRestart False board >> return ()
+        "stats_hill"    -> askDim >>= runStats hillClimbing board
+        "stats_hill_rr" -> askDim >>= runStats hillClimbingRandomRestart board
+        "q"             -> exitProgram
+        otherwise       -> wrongInput board
 ------------------------------------------------------------------------------------------------------------------------
 
 -- Oh I'm sure you'll recognize that...
@@ -157,15 +142,23 @@ exitProgram =
     putStrLn "Program. Terminated."
     >> exitSuccess
 
+askDim :: IO Int
+askDim = do
+    putStr "What dimension for the board(s) [8]?\n> " >> hFlush stdout
+    rawInput <- getLine
+    let dim = if rawInput == "" then 8 else read rawInput
+    return dim
+
 -- Generates a random board
-generateRandomN :: IORef (Maybe Board) -> Int -> IO ()
-generateRandomN board n = do
+generateRandomN :: Bool -> IORef (Maybe Board) -> Int -> IO ()
+generateRandomN verbose board n = do
     randomOffsets <- newStdGen >>= return . randomRs (0,n-1) :: IO [Int]
     let randomPositions = zip randomOffsets [0..(n-1)]
         newBoard = createBoard n randomPositions
     writeIORef board (Just newBoard)
-    putStrLn "New board generated"
-    when (n <= 20) (displayBoard newBoard)
+    when verbose $ do
+        putStrLn "New board generated"
+        when (n <= 20) (displayBoard newBoard)
 
 -- Generate *ALL* successors (be careful of size)
 generateAllSuccessors :: Board -> [Board]
@@ -182,37 +175,134 @@ generateAllSuccessors board@(Board n xs) =
 
 ------------------------------------------------------------------------------------------------------------------------
 
-hillClimbing :: IORef (Maybe Board) -> IO ()
-hillClimbing board = do
+hillClimbing :: Bool -> IORef (Maybe Board) -> IO (Maybe (Bool, Int))
+hillClimbing verbose board = do
     board' <- readIORef board
     case board' of
-        Nothing     -> putStrLn "No boad has been generated yet."
+        Nothing     -> do
+            when verbose $
+                putStrLn "No board has been generated yet."
+            return Nothing
         Just b      -> do
             let currentValue = countAttackingPairs b
             if (currentValue == 0) then do
-                putStrLn "No need for algorithm, the board is already solved:"
-                displayBoard b
+                when verbose $ do
+                    putStrLn "No need for algorithm, the board is already solved:"
+                    displayBoard b
+                return $ Just (True, 0)
             else do
-                hillClimbingStep (b, currentValue) board
+                (succeeded, nbOfSteps) <- hillClimbingStep verbose 0 100 (b, currentValue) board
+                when verbose $ do
+                    if succeeded then do
+                        putStrLn $ "Found a solution in " ++ show nbOfSteps ++ " steps."
+                    else do
+                        putStrLn $ "Blocked on a solution after " ++ show nbOfSteps ++ " steps."
+                return $ Just (succeeded, nbOfSteps)
 
-hillClimbingStep :: (Board, Int) -> IORef (Maybe Board) -> IO ()
-hillClimbingStep (stepBoard, stepValue) board = do
+hillClimbingStep :: Bool -> Int -> Int -> (Board, Int) -> IORef (Maybe Board) -> IO (Bool, Int)
+hillClimbingStep verbose moveNb lateralLimit (stepBoard, stepValue) board = do
     let successors = generateAllSuccessors stepBoard
         withCost = map (\board -> (board, countAttackingPairs board)) successors
         sorted = sortBy (\p1 p2 -> compare (snd p1) (snd p2)) withCost
         best = head sorted
     if (snd best == 0) then do
-        putStrLn "Solution found:\n"
         writeIORef board (Just . fst $ best)
-        when (boardDim (fst best) <= 20) (displayBoard (fst best))
+        when verbose $ do
+            putStrLn "Solution found:\n"
+            when (boardDim (fst best) <= 20) (displayBoard (fst best))
+        return (True, moveNb)
     else if (snd best < stepValue) then do
-        putStrLn "Looping on better state..."
-        hillClimbingStep best board
+        when verbose $
+            putStrLn "Looping on better state..."
+        hillClimbingStep verbose (moveNb + 1) lateralLimit best board
     else if (snd best > stepValue) then do
-        putStrLn "Algorithm stopped because only worse states result from this one:"
-        when (boardDim stepBoard <= 20) (displayBoard stepBoard)
+        when verbose $ do
+            putStrLn "Algorithm stopped because only worse states result from this one:"
+            when (boardDim stepBoard <= 20) (displayBoard stepBoard)
+        return (False, moveNb)
     else do
-        putStrLn $ "Algorithm stopped because the best resulting state has the same value as the current one (" ++ show stepValue ++ ")"
+        if lateralLimit > 0 then do
+            when verbose $ do
+                putStrLn "Making a (random) lateral move..."
+            let bestOnPalier = takeWhile ((==) stepValue . snd) sorted
+            (offset, _) <- newStdGen >>= return . randomR (0, length bestOnPalier - 1)
+            hillClimbingStep verbose (moveNb + 1) (lateralLimit - 1) (bestOnPalier !! offset) board
+        else do
+            when verbose $ do
+                putStrLn "Algorithm stopped because it reached maximum of lateral moves"
+            return (False, moveNb)
+
+hillClimbingRandomRestart :: Bool -> IORef (Maybe Board) -> IO (Maybe (Bool, Int))
+hillClimbingRandomRestart verbose board = do
+    board' <- readIORef board
+    case board' of
+        Nothing     -> do
+            when verbose $
+                putStrLn "No board has been generated yet."
+            return Nothing
+        Just b      -> do
+            let currentValue = countAttackingPairs b
+            if (currentValue == 0) then do
+                when verbose $ do
+                    putStrLn "No need for algorithm, the board is already solved:"
+                    displayBoard b
+                return $ Just (True, 0)
+            else do
+                hillClimbingRandomRestart' 0 verbose board >>= return . Just
+
+hillClimbingRandomRestart' :: Int -> Bool -> IORef (Maybe Board) -> IO (Bool, Int)
+hillClimbingRandomRestart' stepNb verbose board = do
+    Just b <- readIORef board
+    let currentValue = countAttackingPairs b
+    (succeeded, nbOfSteps) <- hillClimbingStep verbose 0 100 (b, currentValue) board
+    when verbose $ do
+        if succeeded then do
+            putStrLn $ "Found a solution in " ++ show nbOfSteps ++ " steps."
+        else do
+            putStrLn $ "Solution not reached after " ++ show nbOfSteps ++ ", restarting on random state."
+    if succeeded then
+        return (True, stepNb + nbOfSteps)
+    else do
+        generateRandomN verbose board 8
+        hillClimbingRandomRestart' (stepNb + nbOfSteps) verbose board
+
+------------------------------------------------------------------------------------------------------------------------
+
+{-
+Takes an algorithm as a parameter, asks the user how many boards to run the stats on and compute
+-}
+runStats :: (Bool -> IORef (Maybe Board) -> IO (Maybe (Bool, Int))) -> IORef (Maybe Board) -> Int -> IO ()
+runStats algo board dim = do
+    -- Ask the user how many steps he wants to run the stats on
+    putStr "How many steps do you want to run [100]?\n> " >> hFlush stdout
+    rawInput <- getLine
+    let howMany = if rawInput == "" then 100 else read rawInput
+    -- tId <- forkIO (runStats' algo howMany)
+    putStrLn $ "Launching stats on " ++ show howMany ++ " computations for " ++ show dim ++ "x" ++ show dim ++ " boards."
+    runStats' algo howMany dim
+
+    where
+        runStats' algo howMany dim = do
+            (nbSucceeded, stepsToSucceed, stepsToFail) <- runStats'' 0 0 0 algo howMany dim
+            let percentage = fromInteger nbSucceeded / fromInteger howMany * 100 :: Double
+                avgOK = fromIntegral stepsToSucceed / fromIntegral nbSucceeded :: Double
+                avgKO = fromIntegral stepsToFail / fromIntegral (howMany - nbSucceeded) :: Double
+            putStrLn "\n###########################################################"
+            putStrLn $ "Solved " ++ show nbSucceeded ++ "/" ++ show howMany ++ " (" ++ take 4 (show percentage) ++ "%)."
+            putStrLn $ "It takes an average " ++ show (take 4 (show avgOK)) ++ " steps to find a solution."
+            putStrLn $ "It takes an average " ++ show (take 4 (show avgKO)) ++ " steps to fail."
+            putStrLn "###########################################################\n"
+
+        runStats'' nbSucceeded stepsToSucceed stepsToFail algo 0 _ = do
+            return (nbSucceeded, stepsToSucceed, stepsToFail)
+        runStats'' nbSucceeded stepsToSucceed stepsToFail algo remaining dim = do
+            generateRandomN False board dim
+            b <- readIORef board
+            Just (solved, steps) <- algo False board
+            if solved then
+                runStats'' (nbSucceeded + 1) (stepsToSucceed + steps) stepsToFail algo (remaining - 1) dim
+            else
+                runStats'' nbSucceeded stepsToSucceed (stepsToFail + steps) algo (remaining - 1) dim
 
 ------------------------------------------------------------------------------------------------------------------------
 
@@ -222,20 +312,3 @@ main = do
     greetings
     currentBoard <- newIORef Nothing
     forever (displayMenu >> handleInput currentBoard)
-
-debug :: IORef (Maybe Board) -> IO ()
-debug board = do
-    let board = createBoard 8 [(4,0), (5,1), (6,2), (3,3), (4,4), (5,5), (6,6), (5,7)]
-    -- let board = createBoard 8 [(0, 3), (3, 0), (7, 3), (3, 7), (3,3)]
-    displayBoard board
-    -- putStrLn $ "Attacking pairs: " ++ show (countAttackingPairs board)
-    -- b <- readIORef board
-    -- case b of
-    --     Nothing             -> putStrLn "No board has been generated."
-    --     Just (currentBoard) -> do
-    --         putStrLn "Current Board: "
-    --         displayBoard currentBoard
-    --         putStrLn "\nNow generating all successors (1st column):"
-    --         let succs = generateAllSuccessors currentBoard
-    --             values = map countAttackingPairs succs
-    --         forM_ values print
